@@ -2,11 +2,11 @@ const CACHE_NAME = "magang-ic-v1";
 const APP_SHELL = [
   "./index.html",
   "./manifest.json",
-  "./css/style.css",
-  "./js/app.js",
-  "./js/db.js",
-  "./assets/icon-192.png",
-  "./assets/icon-512.png"
+  "./style.css",
+  "./app.js",
+  "./db.js",
+  "./icon-192.png",
+  "./icon-512.png"
 ];
 
 // Install: cache App Shell (Cache First untuk asset statis)
