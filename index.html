@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Sistem Informasi Magang - SMA IT Insan Cendikia</title>
+  <meta name="theme-color" content="#2563eb" />
+  <link rel="manifest" href="./manifest.json" />
+  <link rel="apple-touch-icon" href="./assets/icon-192.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="./css/style.css" />
+  <script src="./js/db.js"></script>
+  <script src="./js/app.js"></script>
+</head>
+<body x-data="appState()" x-init="init()">
+
+  <!-- TOAST -->
+  <div id="toast-root">
+    <template x-for="t in toasts" :key="t.id">
+      <div class="toast" :class="'toast-' + t.type" x-text="t.message"></div>
+    </template>
+  </div>
+  <div x-show="!online" class="toast toast-warn" style="position:fixed;top:10px;left:50%;transform:translateX(-50%);z-index:60;">
+    ⚠ Mode offline — perubahan akan disinkron otomatis saat online
+  </div>
+
+  <!-- ===================== LOGIN ===================== -->
+  <template x-if="!session">
+    <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--color-bg);padding:16px;">
+      <div class="card" style="width:100%;max-width:380px;">
+        <div style="text-align:center;margin-bottom:24px;">
+          <div style="font-size:40px;">🎓</div>
+          <h1>Sistem Informasi Magang</h1>
+          <p class="caption">SMA IT Insan Cendikia Tenggarong Seberang</p>
+        </div>
+        <form @submit.prevent="login()">
+          <div class="field">
+            <label>NISN / NIP / Email</label>
+            <input type="text" x-model="loginForm.identifier" required autocomplete="username" />
+          </div>
+          <div class="field">
+            <label>Kata Sandi</label>
+            <input type="password" x-model="loginForm.password" required autocomplete="current-password" />
+          </div>
+          <p x-show="loginError" x-text="loginError" style="color:var(--color-error);font-size:13px;margin-bottom:12px;"></p>
+          <button type="submit" class="btn btn-primary btn-block" :disabled="loginLoading" :class="loginLoading && 'is-loading'">
+            <span x-show="loginLoading" class="spinner"></span>
+            <span x-text="loginLoading ? 'Memproses...' : 'Masuk'"></span>
+          </button>
+        </form>
+        <p class="caption" style="text-align:center;margin-top:16px;">
+          Lupa kata sandi? Hubungi Admin/POKJA Magang sekolah.
+        </p>
+      </div>
+    </div>
+  </template>
+
+  <!-- ===================== MAIN APP ===================== -->
+  <template x-if="session">
+    <div id="app">
+      <!-- SIDEBAR (desktop) -->
+      <aside class="sidebar">
+        <div style="padding:0 8px 16px;">
+          <strong style="color:var(--color-primary-dark);">MagangIC</strong>
+          <p class="caption" x-text="session.user.name"></p>
+          <p class="caption" x-text="'Role: ' + session.user.role"></p>
+        </div>
+        <template x-for="item in navItemsForRole()" :key="item.key">
+          <button @click="goto(item.key)" :class="view === item.key && 'active'">
+            <span x-text="item.icon"></span> <span x-text="item.label"></span>
+          </button>
+        </template>
+        <div style="margin-top:auto;padding-top:16px;">
+          <button @click="logout()" style="color:var(--color-error);">🚪 Keluar</button>
+        </div>
+      </aside>
+
+      <div class="main-col">
+        <header class="topbar">
+          <h1 x-text="{
+            dashboard: 'Beranda',
+            logbook: 'Logbook Harian',
+            logbook_form: logbookForm.id ? 'Edit Logbook' : 'Logbook Baru',
+            weekly: 'Jurnal Mingguan',
+            weekly_form: 'Jurnal Mingguan',
+            profile: 'Profil & Nilai',
+            review_queue: 'Antrean Review',
+            admin_users: 'Manajemen Pengguna',
+            admin_placements: 'Manajemen Penempatan',
+            admin_evaluations: 'Rekap Nilai'
+          }[view] || 'MagangIC'"></h1>
+          <button class="btn btn-secondary" style="display:none;" @click="logout()">Keluar</button>
+        </header>
+
+        <main class="content">
+
+          <!-- ============ DASHBOARD ============ -->
+          <template x-if="view === 'dashboard'">
+            <div>
+              <div class="card">
+                <h2 x-text="'Halo, ' + session.user.name + ' 👋'"></h2>
+                <p class="caption" x-show="placement" x-text="placement ? (placement.company_name + ' — ' + placement.department) : ''"></p>
+              </div>
+              <div class="grid-2">
+                <div class="card"><p class="caption">Total Logbook</p><h1 x-text="dashboard.total_logbook ?? '-'"></h1></div>
+                <div class="card"><p class="caption">Draft</p><h1 x-text="dashboard.draft ?? '-'"></h1></div>
+                <div class="card"><p class="caption">Menunggu Review</p><h1 x-text="dashboard.submitted ?? '-'"></h1></div>
+                <div class="card"><p class="caption">Disetujui</p><h1 x-text="dashboard.approved ?? '-'"></h1></div>
+              </div>
+              <div class="card" x-show="dashboard.revision_needed">
+                <p>⚠ Ada <strong x-text="dashboard.revision_needed"></strong> logbook yang perlu direvisi.</p>
+                <button class="btn btn-secondary" @click="goto('logbook')">Lihat Logbook</button>
+              </div>
+            </div>
+          </template>
+
+          <!-- ============ LOGBOOK LIST (siswa) ============ -->
+          <template x-if="view === 'logbook'">
+            <div>
+              <button class="btn btn-primary" style="margin-bottom:16px;" @click="openNewLogbook()">+ Tambah Logbook</button>
+
+              <template x-if="logbooks.length === 0">
+                <div class="empty-state card">
+                  <span class="emoji">📓</span>
+                  Belum ada catatan hari ini, yuk isi!
+                </div>
+              </template>
+
+              <template x-for="entry in logbooks" :key="entry.id">
+                <div class="card">
+                  <div style="display:flex;justify-content:space-between;align-items:start;">
+                    <div>
+                      <h2 x-text="entry.date"></h2>
+                      <p class="caption" x-text="entry.work_mode + ' • ' + entry.category"></p>
+                    </div>
+                    <span class="badge" :class="statusBadgeClass(entry.status)">
+                      <span x-text="statusIcon(entry.status)"></span> <span x-text="entry.status"></span>
+                    </span>
+                  </div>
+                  <p style="margin:8px 0;" x-text="entry.activity_desc"></p>
+                  <p class="caption" x-show="entry.mentor_notes" x-text="'Catatan mentor: ' + entry.mentor_notes"></p>
+                  <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
+                    <button class="btn btn-secondary" x-show="!entry.is_locked" @click="editLogbook(entry)">Edit</button>
+                    <button class="btn btn-primary" x-show="!entry.is_locked" @click="submitLogbook(entry)">Kirim</button>
+                    <button class="btn btn-secondary" style="color:var(--color-error);border-color:var(--color-error);" x-show="entry.status === 'Draft'" @click="deleteLogbook(entry)">Hapus</button>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </template>
+
+          <!-- ============ LOGBOOK FORM ============ -->
+          <template x-if="view === 'logbook_form'">
+            <div class="form-2col">
+              <form @submit.prevent="saveLogbookDraft()" class="card">
+                <div class="field">
+                  <label>Tanggal Kegiatan</label>
+                  <input type="date" x-model="logbookForm.date" required />
+                </div>
+                <div class="field">
+                  <label>Mode Kerja</label>
+                  <select x-model="logbookForm.work_mode">
+                    <option value="WFO">WFO (Di Tempat Magang)</option>
+                    <option value="WFH">WFH (Dari Rumah)</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label>Kategori Tugas</label>
+                  <input type="text" x-model="logbookForm.category" placeholder="Administrasi / Pelayanan / Teknis" />
+                </div>
+                <div class="field">
+                  <label>Deskripsi Kegiatan</label>
+                  <textarea x-model="logbookForm.activity_desc" rows="4" required></textarea>
+                </div>
+                <div class="field">
+                  <label>Kendala & Solusi</label>
+                  <textarea x-model="logbookForm.obstacles" rows="3"></textarea>
+                </div>
+                <div class="field">
+                  <label>Foto Bukti Kegiatan</label>
+                  <input type="file" accept="image/*" capture="environment" @change="onPhotoSelected($event.target)" />
+                </div>
+                <p x-show="logbookFormError" x-text="logbookFormError" style="color:var(--color-error);font-size:13px;margin-bottom:12px;"></p>
+                <div style="display:flex;gap:8px;">
+                  <button type="submit" class="btn btn-primary" :disabled="logbookFormLoading">
+                    <span x-show="logbookFormLoading" class="spinner"></span> Simpan Draft
+                  </button>
+                  <button type="button" class="btn btn-secondary" @click="view = 'logbook'">Batal</button>
+                </div>
+              </form>
+              <div class="card" x-show="photoPreview">
+                <p class="caption">Pratinjau Foto</p>
+                <img :src="photoPreview" class="preview" />
+              </div>
+            </div>
+          </template>
+
+          <!-- ============ JURNAL MINGGUAN LIST ============ -->
+          <template x-if="view === 'weekly'">
+            <div>
+              <button class="btn btn-primary" style="margin-bottom:16px;" x-show="session.user.role === 'siswa'" @click="openNewWeekly()">+ Jurnal Minggu Baru</button>
+              <template x-for="w in weeklyList" :key="w.id">
+                <div class="card">
+                  <div style="display:flex;justify-content:space-between;">
+                    <h2 x-text="'Minggu ke-' + w.week_number"></h2>
+                    <span class="badge" :class="statusBadgeClass(w.status)" x-text="w.status"></span>
+                  </div>
+                  <p style="margin:8px 0;" x-text="w.summary_text"></p>
+                  <p class="caption" x-show="w.guru_notes" x-text="'Catatan guru: ' + w.guru_notes"></p>
+                  <div style="display:flex;gap:8px;margin-top:8px;">
+                    <button class="btn btn-secondary" x-show="w.status === 'Draft' && session.user.role === 'siswa'" @click="editWeekly(w)">Edit</button>
+                    <button class="btn btn-primary" x-show="w.status === 'Draft' && session.user.role === 'siswa'" @click="submitWeekly(w)">Kirim</button>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </template>
+
+          <!-- ============ JURNAL MINGGUAN FORM ============ -->
+          <template x-if="view === 'weekly_form'">
+            <form @submit.prevent="saveWeeklyDraft()" class="card">
+              <div class="field">
+                <label>Minggu Ke-</label>
+                <input type="number" min="1" max="8" x-model="weeklyForm.week_number" required />
+              </div>
+              <div class="field">
+                <label>Ringkasan Pembelajaran & Soft Skills</label>
+                <textarea x-model="weeklyForm.summary_text" rows="4" required></textarea>
+              </div>
+              <div class="field">
+                <label>Momen Terbaik Minggu Ini</label>
+                <textarea x-model="weeklyForm.best_moment" rows="2"></textarea>
+              </div>
+              <div class="field">
+                <label>Target Perbaikan Minggu Depan</label>
+                <textarea x-model="weeklyForm.next_target" rows="2"></textarea>
+              </div>
+              <div style="display:flex;gap:8px;">
+                <button type="submit" class="btn btn-primary" :disabled="weeklyFormLoading">Simpan Draft</button>
+                <button type="button" class="btn btn-secondary" @click="view = 'weekly'">Batal</button>
+              </div>
+            </form>
+          </template>
+
+          <!-- ============ PROFIL & NILAI ============ -->
+          <template x-if="view === 'profile'">
+            <div>
+              <div class="card" x-show="placement">
+                <h2>Data Penempatan</h2>
+                <p class="caption">Instansi/Mitra</p>
+                <p x-text="placement?.company_name"></p>
+                <p class="caption" style="margin-top:8px;">Divisi</p>
+                <p x-text="placement?.department"></p>
+                <p class="caption" style="margin-top:8px;">Periode</p>
+                <p x-text="(placement?.start_date || '-') + ' s/d ' + (placement?.end_date || '-')"></p>
+              </div>
+              <div class="card">
+                <h2>Rekap Nilai Akhir</h2>
+                <template x-if="evaluations.length === 0">
+                  <p class="caption">Nilai belum tersedia.</p>
+                </template>
+                <template x-for="ev in evaluations" :key="ev.id">
+                  <div>
+                    <div class="grid-2" style="margin-top:8px;">
+                      <p class="caption">Nilai Mentor (60%)<br /><strong x-text="ev.mentor_score"></strong></p>
+                      <p class="caption">Nilai Logbook<br /><strong x-text="ev.logbook_score"></strong></p>
+                      <p class="caption">Nilai Laporan<br /><strong x-text="ev.report_score"></strong></p>
+                      <p class="caption">Nilai Presentasi<br /><strong x-text="ev.presentation_score"></strong></p>
+                    </div>
+                    <hr style="margin:12px 0;border-color:var(--color-border);" />
+                    <p>Nilai Akhir: <strong x-text="ev.final_score"></strong> — <span x-text="ev.predicate"></span></p>
+                  </div>
+                </template>
+              </div>
+            </div>
+          </template>
+
+          <!-- ============ REVIEW QUEUE (mentor/guru) ============ -->
+          <template x-if="view === 'review_queue'">
+            <div>
+              <template x-if="reviewQueue.length === 0">
+                <div class="empty-state card"><span class="emoji">✅</span>Tidak ada yang menunggu review saat ini.</div>
+              </template>
+              <template x-for="item in reviewQueue" :key="item.id">
+                <div class="card">
+                  <template x-if="session.user.role === 'mentor'">
+                    <div>
+                      <h2 x-text="item.date"></h2>
+                      <p class="caption" x-text="item.work_mode + ' • ' + item.category"></p>
+                      <p style="margin:8px 0;" x-text="item.activity_desc"></p>
+                      <div style="display:flex;gap:8px;">
+                        <button class="btn btn-primary" @click="validateLogbook(item, 'approve')">✓ Setujui</button>
+                        <button class="btn btn-secondary" style="color:var(--color-error);border-color:var(--color-error);" @click="validateLogbook(item, 'reject')">⚠ Minta Revisi</button>
+                      </div>
+                    </div>
+                  </template>
+                  <template x-if="session.user.role === 'guru'">
+                    <div>
+                      <h2 x-text="'Minggu ke-' + item.week_number"></h2>
+                      <p style="margin:8px 0;" x-text="item.summary_text"></p>
+                      <button class="btn btn-primary" @click="verifyWeekly(item)">✓ Verifikasi</button>
+                    </div>
+                  </template>
+                </div>
+              </template>
+            </div>
+          </template>
+
+          <!-- ============ ADMIN: USERS ============ -->
+          <template x-if="view === 'admin_users'">
+            <div>
+              <div class="card">
+                <h2>Tambah Pengguna</h2>
+                <div class="grid-2" style="margin-top:12px;">
+                  <div class="field"><label>NISN/NIP/ID</label><input x-model="newUserForm.identity_number" /></div>
+                  <div class="field"><label>Nama Lengkap</label><input x-model="newUserForm.name" /></div>
+                  <div class="field"><label>Email</label><input type="email" x-model="newUserForm.email" /></div>
+                  <div class="field">
+                    <label>Peran</label>
+                    <select x-model="newUserForm.role">
+                      <option value="siswa">Siswa</option>
+                      <option value="mentor">Mentor Industri</option>
+                      <option value="guru">Guru Pendamping</option>
+                      <option value="admin">Admin/POKJA</option>
+                    </select>
+                  </div>
+                  <div class="field"><label>No. WhatsApp/HP</label><input x-model="newUserForm.phone_number" /></div>
+                </div>
+                <button class="btn btn-primary" @click="createUser()">Simpan Pengguna</button>
+              </div>
+
+              <div class="card">
+                <h2>Impor Massal Siswa (CSV)</h2>
+                <p class="caption">Format per baris: nisn,nama,email,no_hp,nama_instansi,divisi,tgl_mulai,tgl_selesai</p>
+                <textarea rows="4" x-model="bulkImportRaw" placeholder="1234,Budi Santoso,budi@mail.com,08123,Puskesmas A,Farmasi,2026-01-05,2026-03-05"></textarea>
+                <div style="display:flex;gap:8px;margin-top:8px;">
+                  <button class="btn btn-secondary" @click="parseBulkImport()">Pratinjau</button>
+                  <button class="btn btn-primary" @click="submitBulkImport()" x-show="bulkImportRows.length">Impor <span x-text="bulkImportRows.length"></span> Siswa</button>
+                </div>
+              </div>
+
+              <div class="card overflow-x">
+                <h2>Daftar Pengguna</h2>
+                <table class="data-table">
+                  <thead><tr><th>ID</th><th>Nama</th><th>Email</th><th>Peran</th><th>HP</th></tr></thead>
+                  <tbody>
+                    <template x-for="u in users" :key="u.id">
+                      <tr>
+                        <td x-text="u.id"></td><td x-text="u.name"></td><td x-text="u.email"></td>
+                        <td x-text="u.role"></td><td x-text="u.phone_number"></td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </template>
+
+          <!-- ============ ADMIN: PLACEMENTS ============ -->
+          <template x-if="view === 'admin_placements'">
+            <div>
+              <div class="card">
+                <h2>Tambah Penempatan</h2>
+                <div class="grid-2" style="margin-top:12px;">
+                  <div class="field"><label>ID Siswa</label><input x-model="newPlacementForm.student_id" placeholder="USR-xxx" /></div>
+                  <div class="field"><label>ID Mentor</label><input x-model="newPlacementForm.mentor_id" placeholder="USR-xxx" /></div>
+                  <div class="field"><label>ID Guru Pendamping</label><input x-model="newPlacementForm.guru_id" placeholder="USR-xxx" /></div>
+                  <div class="field"><label>Nama Instansi</label><input x-model="newPlacementForm.company_name" /></div>
+                  <div class="field"><label>Divisi</label><input x-model="newPlacementForm.department" /></div>
+                  <div class="field"><label>Tanggal Mulai</label><input type="date" x-model="newPlacementForm.start_date" /></div>
+                  <div class="field"><label>Tanggal Selesai</label><input type="date" x-model="newPlacementForm.end_date" /></div>
+                </div>
+                <button class="btn btn-primary" @click="createPlacement()">Simpan Penempatan</button>
+              </div>
+              <div class="card overflow-x">
+                <h2>Daftar Penempatan</h2>
+                <table class="data-table">
+                  <thead><tr><th>ID</th><th>Siswa</th><th>Instansi</th><th>Mentor</th><th>Guru</th><th>Status</th></tr></thead>
+                  <tbody>
+                    <template x-for="p in placements" :key="p.id">
+                      <tr>
+                        <td x-text="p.id"></td><td x-text="p.student_id"></td><td x-text="p.company_name"></td>
+                        <td x-text="p.mentor_id"></td><td x-text="p.guru_id"></td><td x-text="p.status"></td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </template>
+
+          <!-- ============ ADMIN: EVALUATIONS ============ -->
+          <template x-if="view === 'admin_evaluations'">
+            <div class="card">
+              <h2>Input Nilai Akhir Magang</h2>
+              <p class="caption">Rumus: NA = 0.60 × Nilai Mentor + 0.40 × rata-rata(Logbook, Laporan, Presentasi)</p>
+              <div class="grid-2" style="margin-top:12px;">
+                <div class="field"><label>ID Penempatan</label><input x-model="evaluationForm.placement_id" placeholder="PLC-xxx" /></div>
+                <div class="field"><label>Nilai Mentor (0-100)</label><input type="number" x-model="evaluationForm.mentor_score" /></div>
+                <div class="field"><label>Nilai Logbook (0-100)</label><input type="number" x-model="evaluationForm.logbook_score" /></div>
+                <div class="field"><label>Nilai Laporan (0-100)</label><input type="number" x-model="evaluationForm.report_score" /></div>
+                <div class="field"><label>Nilai Presentasi (0-100)</label><input type="number" x-model="evaluationForm.presentation_score" /></div>
+              </div>
+              <button class="btn btn-primary" @click="saveEvaluation()">Hitung & Simpan Nilai</button>
+            </div>
+          </template>
+
+        </main>
+      </div>
+
+      <!-- BOTTOM NAV (mobile) -->
+      <nav class="bottom-nav">
+        <template x-for="item in navItemsForRole()" :key="item.key">
+          <button @click="goto(item.key)" :class="view === item.key && 'active'">
+            <span class="icon" x-text="item.icon"></span>
+            <span x-text="item.label"></span>
+          </button>
+        </template>
+      </nav>
+    </div>
+  </template>
+
+  <script src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+  <script>
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => navigator.serviceWorker.register("./sw.js"));
+    }
+  </script>
+</body>
+</html>
