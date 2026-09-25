@@ -2,7 +2,7 @@
  * app.js — logic utama Sistem Informasi Magang (frontend PWA).
  * Ganti API_URL di bawah dengan URL deployment Web App Google Apps Script Anda.
  */
-const API_URL = "https://script.google.com/macros/s/GANTI_DENGAN_DEPLOYMENT_ID_ANDA/exec";
+const API_URL = "https://script.google.com/macros/s/AKfycbx2nrHDqeTBDv22mJJON7pMMSiO59UIJbdQDHI9iMPRrwHKAI6wmHKAUOoK3arkSPLpsg/exec";
 
 const STATUS_META = {
   Draft: { badge: "badge-draft", icon: "✎" },
