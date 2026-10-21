@@ -55,10 +55,19 @@ function appState() {
     newPlacementForm: { student_id: "", mentor_id: "", guru_id: "", company_name: "", department: "", start_date: "", end_date: "" },
     evaluationForm: { placement_id: "", mentor_score: "", logbook_score: "", report_score: "", presentation_score: "" },
 
+    // ---------- kredensial sementara (hanya di memori, tidak disimpan) ----------
+    credentials: [],
+    pwForm: { old_password: "", new_password: "", confirm: "" },
+    pwLoading: false,
+
     // ==========================================================
     init() {
       window.addEventListener("online", () => { this.online = true; this.syncQueue(); });
       window.addEventListener("offline", () => { this.online = false; });
+      // Kata sandi sementara tidak bisa ditampilkan lagi: cegah tertutup tak sengaja.
+      window.addEventListener("beforeunload", (e) => {
+        if (this.credentials.length) { e.preventDefault(); e.returnValue = ""; }
+      });
       navigator.serviceWorker && navigator.serviceWorker.addEventListener("message", (evt) => {
         if (evt.data && evt.data.type === "SYNC_QUEUE") this.syncQueue();
       });
@@ -276,6 +285,7 @@ function appState() {
     async logout(silent) {
       if (!silent) await this.apiPost("logout", {}, { quiet: true });
       this.session = null;
+      this.credentials = [];
       localStorage.removeItem("magang_session");
       this.view = "dashboard";
     },
@@ -499,7 +509,14 @@ function appState() {
     async createUser() {
       const json = await this.apiPost("create_user", this.newUserForm);
       if (json.status === "success") {
-        this.toast("Pengguna dibuat. Password sementara: " + json.temp_password, "success", 8000);
+        this.credentials = [{
+          user_id: json.id,
+          name: this.newUserForm.name,
+          identity_number: this.newUserForm.identity_number,
+          email: this.newUserForm.email,
+          temp_password: json.temp_password
+        }];
+        this.toast("Pengguna dibuat. Kata sandi sementara ada di kartu atas.", "success", 6000);
         this.newUserForm = { identity_number: "", name: "", email: "", role: "siswa", phone_number: "" };
         this.loadUsers();
       } else {
@@ -531,13 +548,90 @@ function appState() {
       if (!this.bulkImportRows.length) { this.toast("Belum ada baris untuk diimpor.", "warn"); return; }
       const json = await this.apiPost("bulk_import_students", { students: this.bulkImportRows });
       if (json.status === "success") {
-        this.toast(json.created.length + " siswa berhasil diimpor.", "success", 6000);
+        const rows = this.bulkImportRows;
+        this.credentials = json.created.map((c, i) => ({
+          user_id: c.user_id,
+          name: c.name,
+          identity_number: rows[i] ? rows[i].identity_number : "",
+          email: rows[i] ? rows[i].email : "",
+          temp_password: c.temp_password
+        }));
+        this.toast(json.created.length + " siswa berhasil diimpor. Unduh kata sandi sementara sekarang.", "success", 8000);
         this.bulkImportRaw = "";
         this.bulkImportRows = [];
         this.loadUsers();
         this.loadPlacements();
       } else {
         this.toast(json.message || "Gagal impor massal.", "error");
+      }
+    },
+
+    // ---------- kredensial & password ----------
+    csvCell(v) {
+      let s = String(v === undefined || v === null ? "" : v);
+      if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; // cegah formula injection di Excel
+      return '"' + s.replace(/"/g, '""') + '"';
+    },
+
+    downloadCredentials() {
+      if (!this.credentials.length) return;
+      const lines = [["nama", "id_login", "email", "kata_sandi_sementara"].join(",")];
+      this.credentials.forEach((c) => {
+        lines.push([c.name, c.identity_number, c.email, c.temp_password].map((v) => this.csvCell(v)).join(","));
+      });
+      const blob = new Blob(["\ufeff" + lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "kredensial-" + new Date().toISOString().slice(0, 10) + ".csv";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    },
+
+    clearCredentials() {
+      if (!confirm("Tutup kartu ini? Kata sandi sementara tidak bisa dilihat lagi. Sudah diunduh atau dicatat?")) return;
+      this.credentials = [];
+    },
+
+    async resetUserPassword(u) {
+      if (!confirm("Reset kata sandi " + u.name + "? Kata sandi lama tidak berlaku dan sesi login pengguna ini diputus.")) return;
+      const json = await this.apiPost("admin_reset_password", { user_id: u.id });
+      if (json.status === "success") {
+        this.credentials = [{
+          user_id: u.id,
+          name: u.name,
+          identity_number: u.identity_number,
+          email: u.email,
+          temp_password: json.temp_password
+        }];
+        this.toast("Kata sandi direset. Lihat kartu di atas.", "success");
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      } else {
+        this.toast(json.message || "Gagal reset kata sandi.", "error");
+      }
+    },
+
+    async changePassword() {
+      const f = this.pwForm;
+      if (f.new_password.length < 8) { this.toast("Kata sandi baru minimal 8 karakter.", "warn"); return; }
+      if (f.new_password !== f.confirm) { this.toast("Ulangi kata sandi baru dengan sama persis.", "warn"); return; }
+      if (f.new_password === f.old_password) { this.toast("Kata sandi baru harus berbeda dari yang lama.", "warn"); return; }
+      this.pwLoading = true;
+      try {
+        const json = await this.apiPost("change_password", {
+          old_password: f.old_password,
+          new_password: f.new_password
+        }, { quiet: false });
+        if (json.status === "success") {
+          this.toast("Kata sandi berhasil diganti.", "success");
+          this.pwForm = { old_password: "", new_password: "", confirm: "" };
+        } else if (json.status !== "unauthorized") {
+          this.toast(json.message || "Gagal mengganti kata sandi.", "error");
+        }
+      } finally {
+        this.pwLoading = false;
       }
     },
 
