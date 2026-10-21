@@ -1,6 +1,6 @@
 // Naikkan versi ini setiap kali file shell (manifest/ikon) berubah.
 // index.html sendiri tidak bergantung pada versi ini: navigasi memakai network-first.
-const CACHE_NAME = "magang-ic-v8";
+const CACHE_NAME = "magang-ic-v9";
 const RUNTIME_CACHE = "magang-ic-runtime-v1"; // Alpine (unpkg) + Google Fonts
 const KEEP_CACHES = [CACHE_NAME, RUNTIME_CACHE];
 
