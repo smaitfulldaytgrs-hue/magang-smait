@@ -113,6 +113,27 @@
                 <p>⚠ Ada <strong x-text="dashboard.revision_needed"></strong> logbook yang perlu direvisi.</p>
                 <button class="btn btn-secondary" @click="goto('logbook')">Lihat Logbook</button>
               </div>
+
+              <div class="card">
+                <h2>Ganti Kata Sandi</h2>
+                <form @submit.prevent="changePassword()" style="margin-top:12px;">
+                  <div class="field">
+                    <label>Kata Sandi Lama</label>
+                    <input type="password" x-model="pwForm.old_password" required autocomplete="current-password" />
+                  </div>
+                  <div class="field">
+                    <label>Kata Sandi Baru (min. 8 karakter)</label>
+                    <input type="password" x-model="pwForm.new_password" required minlength="8" autocomplete="new-password" />
+                  </div>
+                  <div class="field">
+                    <label>Ulangi Kata Sandi Baru</label>
+                    <input type="password" x-model="pwForm.confirm" required minlength="8" autocomplete="new-password" />
+                  </div>
+                  <button type="submit" class="btn btn-primary" :disabled="pwLoading">
+                    <span x-show="pwLoading" class="spinner"></span> Simpan Kata Sandi
+                  </button>
+                </form>
+              </div>
             </div>
           </template>
 
@@ -311,6 +332,30 @@
           <!-- ============ ADMIN: USERS ============ -->
           <template x-if="view === 'admin_users'">
             <div>
+              <div class="card" x-show="credentials.length" style="border-color:var(--color-error);">
+                <h2>Kata Sandi Sementara</h2>
+                <p class="caption" style="margin:4px 0 12px;">Hanya tampil sekarang. Setelah ditutup atau halaman dimuat ulang, kata sandi tidak bisa dilihat lagi. Unduh lalu bagikan ke pengguna lewat jalur aman.</p>
+                <div class="overflow-x">
+                  <table class="data-table">
+                    <thead><tr><th>Nama</th><th>ID Login</th><th>Email</th><th>Kata Sandi</th></tr></thead>
+                    <tbody>
+                      <template x-for="c in credentials" :key="c.user_id">
+                        <tr>
+                          <td x-text="c.name"></td>
+                          <td x-text="c.identity_number"></td>
+                          <td x-text="c.email"></td>
+                          <td style="font-family:ui-monospace,Menlo,Consolas,monospace;" x-text="c.temp_password"></td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                </div>
+                <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
+                  <button class="btn btn-primary" @click="downloadCredentials()">Unduh CSV</button>
+                  <button class="btn btn-secondary" @click="clearCredentials()">Tutup</button>
+                </div>
+              </div>
+
               <div class="card">
                 <h2>Tambah Pengguna</h2>
                 <div class="grid-2" style="margin-top:12px;">
@@ -344,12 +389,13 @@
               <div class="card overflow-x">
                 <h2>Daftar Pengguna</h2>
                 <table class="data-table">
-                  <thead><tr><th>ID</th><th>Nama</th><th>Email</th><th>Peran</th><th>HP</th></tr></thead>
+                  <thead><tr><th>ID</th><th>Nama</th><th>Email</th><th>Peran</th><th>HP</th><th></th></tr></thead>
                   <tbody>
                     <template x-for="u in users" :key="u.id">
                       <tr>
                         <td x-text="u.id"></td><td x-text="u.name"></td><td x-text="u.email"></td>
                         <td x-text="u.role"></td><td x-text="u.phone_number"></td>
+                        <td><button class="btn btn-secondary" style="min-height:32px;font-size:12px;" @click="resetUserPassword(u)">Reset Sandi</button></td>
                       </tr>
                     </template>
                   </tbody>
