@@ -1,4 +1,4 @@
-const CACHE_NAME = "magang-ic-v3";
+const CACHE_NAME = "magang-ic-v5";
 const APP_SHELL = [
   "./index.html",
   "./manifest.json",
