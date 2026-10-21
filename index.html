@@ -493,7 +493,7 @@ function uuidv4() {
  * app.js — logic utama Sistem Informasi Magang (frontend PWA).
  * Ganti API_URL di bawah dengan URL deployment Web App Google Apps Script Anda.
  */
-const APP_VERSION = "2026-10-21.5";
+const APP_VERSION = "2026-10-21.6";
 const API_URL = "https://script.google.com/macros/s/AKfycbwZs-n_57n6jkug248_sls9GlzLcPHhOjdEFkx8BVXxSOFQONYHwrWOLvBCN2E2OlRS/exec";
 
 const STATUS_META = {
@@ -671,8 +671,12 @@ function appState() {
 
     handleAuthErrors(json) {
       if (json && json.status === "unauthorized") {
+        // Sesi tidak valid/kedaluwarsa: keluar paksa.
         this.toast(json.message || "Sesi berakhir, silakan login ulang.", "error");
         this.logout(true);
+      } else if (json && json.status === "forbidden") {
+        // Sesi valid tapi tidak berhak atas aksi/data ini: cukup beri tahu, JANGAN logout.
+        this.toast(json.message || "Anda tidak berhak melakukan aksi ini.", "error");
       }
     },
 
@@ -1223,10 +1227,17 @@ function appState() {
   };
 }
 
+// Tanggal lokal perangkat (yyyy-MM-dd). toISOString() memakai UTC sehingga di WITA
+// jam 00:00-07:59 menghasilkan tanggal kemarin.
+function localDateString(d = new Date()) {
+  const p = (n) => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+}
+
 function this_defaultLogbookForm() {
   return {
     id: null,
-    date: new Date().toISOString().slice(0, 10),
+    date: localDateString(),
     work_mode: "WFO",
     category: "Administrasi",
     activity_desc: "",
