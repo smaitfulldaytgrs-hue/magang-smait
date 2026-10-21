@@ -20,6 +20,7 @@ function appState() {
     online: navigator.onLine,
     toasts: [],
     loading: false,
+    syncing: false,
 
     // ---------- form login ----------
     loginForm: { identifier: "", password: "" },
@@ -130,23 +131,34 @@ function appState() {
       return json;
     },
 
-    async apiPost(action, payload = {}, { queueOffline = false } = {}) {
+    async apiPost(action, payload = {}, { queueOffline = false, quiet = false } = {}) {
       const body = { action, session_token: this.session ? this.session.session_token : "", ...payload };
+      let json;
       try {
         const res = await fetch(API_URL, { method: "POST", body: JSON.stringify(body) });
-        const json = await res.json();
-        this.handleAuthErrors(json);
-        return json;
+        json = await res.json();
+        // sw.js membalas {status:"offline"} (bukan melempar error) saat jaringan mati.
+        // Perlakukan sama dengan gagal jaringan supaya masuk antrean.
+        if (json && json.status === "offline") throw new Error("offline");
       } catch (err) {
         if (queueOffline) {
           const client_uuid = payload.client_uuid || uuidv4();
-          await queueAdd({ client_uuid, action, payload: { ...body, client_uuid }, savedAt: Date.now() });
+          await queueAdd({
+            client_uuid,
+            action,
+            user_id: this.session ? this.session.user.id : null, // cegah kirim ke akun lain di HP yang sama
+            payload: { ...body, client_uuid },
+            savedAt: Date.now(),
+            attempts: 0
+          });
           this.toast("Tersimpan di HP, akan terkirim otomatis saat online.", "warn");
           return { status: "offline_queued", client_uuid };
         }
-        this.toast("Gagal terhubung ke server.", "error");
+        if (!quiet) this.toast("Gagal terhubung ke server.", "error");
         return { status: "error", message: "network" };
       }
+      this.handleAuthErrors(json);
+      return json;
     },
 
     handleAuthErrors(json) {
@@ -157,21 +169,82 @@ function appState() {
     },
 
     async syncQueue() {
-      const items = await queueAll();
-      for (const item of items) {
-        try {
-          const res = await fetch(API_URL, { method: "POST", body: JSON.stringify(item.payload) });
-          const json = await res.json();
-          if (json.status === "success" || json.status === "unauthorized") {
-            await queueRemove(item.client_uuid);
-          } else {
-            break; // biarkan retry berikutnya
+      // Tanpa sesi tidak ada token valid: antrean dibiarkan, dikirim setelah login.
+      if (this.syncing || !this.session) return;
+      this.syncing = true;
+      const MAX_ATTEMPTS = 5;
+      const TRANSIENT = /sibuk|kesalahan server/i;
+      let sent = 0;
+      let failed = 0;
+      try {
+        const items = (await queueAll())
+          .filter((it) => !it.failed)
+          .filter((it) => !it.user_id || it.user_id === this.session.user.id)
+          .sort((a, b) => (a.savedAt || 0) - (b.savedAt || 0)); // urut waktu, bukan urut uuid
+
+        for (const item of items) {
+          // Token dari saat antre sudah basi setelah login ulang: pakai token sesi sekarang.
+          const payload = { ...item.payload, session_token: this.session.session_token };
+
+          let res;
+          try {
+            res = await fetch(API_URL, { method: "POST", body: JSON.stringify(payload) });
+          } catch (err) {
+            break; // masih offline, coba lagi nanti
           }
-        } catch (err) {
-          break; // masih offline, hentikan, coba lagi nanti
+
+          let json;
+          try {
+            json = await res.json();
+          } catch (err) {
+            json = { status: "error", message: "Respons server tidak valid." };
+          }
+
+          if (json.status === "offline") break; // balasan sw.js saat jaringan mati
+
+          if (json.status === "success") {
+            await queueRemove(item.client_uuid);
+            sent++;
+            continue;
+          }
+
+          if (json.status === "unauthorized") {
+            // Jangan hapus item. Setelah login ulang antrean dikirim lagi.
+            this.handleAuthErrors(json);
+            break;
+          }
+
+          // status "error"
+          const attempts = (item.attempts || 0) + 1;
+          const transient = TRANSIENT.test(json.message || "");
+          if (!transient || attempts >= MAX_ATTEMPTS) {
+            // Ditolak server (mis. "Logbook terkunci") atau gagal berulang:
+            // tandai gagal, simpan agar tidak hilang, JANGAN sumbat item lain.
+            await queueAdd({ ...item, attempts, failed: true, error: json.message || "error" });
+            failed++;
+            continue;
+          }
+          await queueAdd({ ...item, attempts });
+          break; // gangguan sementara, coba lagi nanti
         }
+      } finally {
+        this.syncing = false;
       }
-      if (items.length) this.toast("Sinkronisasi data offline selesai.", "success");
+
+      if (sent) {
+        this.toast(sent + " data offline berhasil dikirim.", "success");
+        this.refreshCurrentView();
+      }
+      if (failed) {
+        this.toast(failed + " data offline ditolak server dan tidak terkirim. Cek ulang lalu isi kembali.", "error", 8000);
+      }
+    },
+
+    refreshCurrentView() {
+      if (this.view === "logbook") this.loadLogbooks();
+      else if (this.view === "weekly") this.loadWeekly();
+      else if (this.view === "dashboard") this.loadDashboard();
+      else if (this.view === "review_queue") this.loadReviewQueue();
     },
 
     // ================= AUTH =================
@@ -189,6 +262,7 @@ function appState() {
           localStorage.setItem("magang_session", JSON.stringify(json));
           this.toast("Selamat datang, " + json.user.name, "success");
           this.loadDashboard();
+          this.syncQueue();
         } else {
           this.loginError = json.message || "Login gagal.";
         }
@@ -200,7 +274,7 @@ function appState() {
     },
 
     async logout(silent) {
-      if (!silent) await this.apiPost("logout");
+      if (!silent) await this.apiPost("logout", {}, { quiet: true });
       this.session = null;
       localStorage.removeItem("magang_session");
       this.view = "dashboard";
@@ -265,14 +339,18 @@ function appState() {
       this.logbookFormLoading = true;
       try {
         let photoUrl = this.logbookForm.photo_drive_url || "";
-        if (this.photoBase64 && this.online) {
-          const up = await this.apiPost("upload_photo", {
-            placement_id: this.placement ? this.placement.id : this.logbookForm.placement_id,
-            photo_base64: this.photoBase64,
-            mime_type: "image/jpeg",
-            file_name: "bukti_" + this.logbookForm.date + ".jpg"
-          });
-          if (up.status === "success") photoUrl = up.photo_drive_url;
+        let photoSkipped = false;
+        if (this.photoBase64) {
+          const up = this.online
+            ? await this.apiPost("upload_photo", {
+                placement_id: this.placement ? this.placement.id : this.logbookForm.placement_id,
+                photo_base64: this.photoBase64,
+                mime_type: "image/jpeg",
+                file_name: "bukti_" + this.logbookForm.date + ".jpg"
+              }, { quiet: true })
+            : null;
+          if (up && up.status === "success") photoUrl = up.photo_drive_url;
+          else photoSkipped = true; // offline / upload gagal: beri tahu, jangan diam
         }
         const payload = {
           id: this.logbookForm.id || null,
@@ -288,6 +366,9 @@ function appState() {
         const json = await this.apiPost("save_logbook", payload, { queueOffline: true });
         if (json.status === "success" || json.status === "offline_queued") {
           this.toast(json.status === "success" ? "Draft tersimpan." : "Draft disimpan lokal (offline).", "success");
+          if (photoSkipped) {
+            this.toast("Foto belum terunggah. Buka draft ini saat online lalu pilih foto lagi.", "warn", 8000);
+          }
           this.view = "logbook";
           this.loadLogbooks();
         } else {
