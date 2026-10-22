@@ -400,6 +400,12 @@ img.preview {
   border-radius: var(--radius);
   border: 1px solid var(--color-border);
 }
+
+/* Tombol keluar di topbar: tampil di HP, disembunyikan di desktop (sudah ada di sidebar). */
+.topbar-logout { min-height: 36px; }
+@media (min-width: 900px) {
+  button.btn.topbar-logout { display: none; } /* selektor setara button.btn agar menang atas display:inline-flex */
+}
   </style>
   <script>
 /* ===================== db.js ===================== */
@@ -488,12 +494,24 @@ function uuidv4() {
   });
 }
 
+// Daftarkan Background Sync (Chrome/Android). Tidak didukung di iOS/Firefox: di sana
+// pengiriman ulang jalan lewat event online, saat aplikasi dibuka lagi, dan timer 1 menit.
+function registerBackgroundSync() {
+  try {
+    if ("serviceWorker" in navigator && "SyncManager" in window) {
+      navigator.serviceWorker.ready
+        .then((reg) => reg.sync.register("sync-logbook-queue"))
+        .catch(() => {});
+    }
+  } catch (e) { /* abaikan */ }
+}
+
 /* ===================== app.js ===================== */
 /**
  * app.js — logic utama Sistem Informasi Magang (frontend PWA).
  * Ganti API_URL di bawah dengan URL deployment Web App Google Apps Script Anda.
  */
-const APP_VERSION = "2026-10-21.6";
+const APP_VERSION = "2026-10-22.1";
 const API_URL = "https://script.google.com/macros/s/AKfycbwZs-n_57n6jkug248_sls9GlzLcPHhOjdEFkx8BVXxSOFQONYHwrWOLvBCN2E2OlRS/exec";
 
 const STATUS_META = {
@@ -530,6 +548,9 @@ function appState() {
     users: [],
     placements: [],
     reviewQueue: [],
+    queueItems: [],      // antrean offline milik akun ini (IndexedDB)
+    photoCache: {},      // id logbook -> data URL foto (hanya di memori)
+    photoLoading: {},
 
     // ---------- form logbook ----------
     logbookForm: this_defaultLogbookForm(),
@@ -546,7 +567,8 @@ function appState() {
     bulkImportRows: [],
     bulkImportRaw: "",
     newUserForm: { identity_number: "", name: "", email: "", role: "siswa", phone_number: "" },
-    newPlacementForm: { student_id: "", mentor_id: "", guru_id: "", company_name: "", department: "", start_date: "", end_date: "" },
+    newPlacementForm: { student_id: "", mentor_id: "", guru_id: "", company_name: "", department: "", start_date: "", end_date: "", status: "active" },
+    editingPlacementId: null,
     evaluationForm: { placement_id: "", mentor_score: "", logbook_score: "", report_score: "", presentation_score: "" },
 
     // ---------- kredensial sementara (hanya di memori, tidak disimpan) ----------
@@ -565,8 +587,17 @@ function appState() {
       navigator.serviceWorker && navigator.serviceWorker.addEventListener("message", (evt) => {
         if (evt.data && evt.data.type === "SYNC_QUEUE") this.syncQueue();
       });
+      // Kembali ke aplikasi (mis. dari aplikasi lain): coba kirim ulang antrean.
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible" && this.online && this.session) this.syncQueue();
+      });
+      // Cadangan bila Background Sync tidak ada: ulangi tiap menit selama ada antrean.
+      setInterval(() => {
+        if (this.online && this.session && this.queueItems.some((i) => !i.failed)) this.syncQueue();
+      }, 60000);
       if (this.session) {
         this.loadDashboard();
+        this.refreshQueue();
         this.syncQueue();
       }
     },
@@ -627,10 +658,11 @@ function appState() {
 
     // ================= API LAYER =================
     async apiGet(action, params = {}) {
-      const qs = new URLSearchParams({ action, session_token: this.session ? this.session.session_token : "", ...params });
+      // Lewat POST (bukan GET) supaya token sesi tidak masuk URL, riwayat browser, atau log.
+      const body = { action, session_token: this.session ? this.session.session_token : "", ...params };
       let json;
       try {
-        const res = await fetch(API_URL + "?" + qs.toString());
+        const res = await fetch(API_URL, { method: "POST", body: JSON.stringify(body) });
         json = await res.json();
       } catch (err) {
         return { status: "offline" }; // jaringan mati / respons bukan JSON: pemanggil cukup abaikan
@@ -659,6 +691,8 @@ function appState() {
             savedAt: Date.now(),
             attempts: 0
           });
+          this.refreshQueue();
+          registerBackgroundSync();
           this.toast("Tersimpan di HP, akan terkirim otomatis saat online.", "warn");
           return { status: "offline_queued", client_uuid };
         }
@@ -741,6 +775,7 @@ function appState() {
         }
       } finally {
         this.syncing = false;
+        this.refreshQueue();
       }
 
       if (sent) {
@@ -750,6 +785,70 @@ function appState() {
       if (failed) {
         this.toast(failed + " data offline ditolak server dan tidak terkirim. Cek ulang lalu isi kembali.", "error", 8000);
       }
+    },
+
+    // ================= ANTREAN OFFLINE =================
+    async refreshQueue() {
+      try {
+        const uid = this.session ? this.session.user.id : null;
+        this.queueItems = (await queueAll())
+          .filter((it) => !it.user_id || it.user_id === uid)
+          .sort((a, b) => (a.savedAt || 0) - (b.savedAt || 0));
+      } catch (err) {
+        this.queueItems = [];
+      }
+    },
+
+    queueLabel(it) {
+      const p = it.payload || {};
+      const map = {
+        save_logbook: "Simpan logbook " + (p.date || ""),
+        submit_logbook: "Kirim logbook",
+        save_weekly: "Simpan jurnal minggu ke-" + (p.week_number || "?"),
+        submit_weekly: "Kirim jurnal"
+      };
+      return map[it.action] || it.action;
+    },
+
+    pendingQueue() { return this.queueItems.filter((i) => !i.failed); },
+
+    async retryQueueItem(it) {
+      // `it` berasal dari state Alpine (Proxy): IndexedDB tidak bisa menyimpan Proxy, jadi salin dulu.
+      const plain = JSON.parse(JSON.stringify(it));
+      await queueAdd({ ...plain, failed: false, attempts: 0, error: "" });
+      await this.refreshQueue();
+      this.syncQueue();
+    },
+
+    async discardQueueItem(it) {
+      if (!confirm("Buang data offline ini? Tidak bisa dikembalikan.")) return;
+      await queueRemove(it.client_uuid);
+      await this.refreshQueue();
+    },
+
+    // Tampilkan pesan gagal dari server. unauthorized/forbidden sudah ditangani handleAuthErrors.
+    reportFailure(json, fallback, ms) {
+      if (!json || json.status === "unauthorized" || json.status === "forbidden" || json.status === "offline_queued") return;
+      const msg = json.message && json.message !== "network" ? json.message : fallback;
+      this.toast(msg, "error", ms || 5000);
+    },
+
+    // ================= FOTO (privat, lewat server) =================
+    async loadPhoto(entryId) {
+      if (this.photoCache[entryId]) return this.photoCache[entryId];
+      if (this.photoLoading[entryId]) return null;
+      this.photoLoading[entryId] = true;
+      try {
+        const json = await this.apiPost("get_photo", { id: entryId }, { quiet: true });
+        if (json.status === "success") {
+          this.photoCache[entryId] = json.data_url;
+          return json.data_url;
+        }
+        this.reportFailure(json, "Foto tidak bisa dimuat. Cek koneksi internet.");
+      } finally {
+        this.photoLoading[entryId] = false;
+      }
+      return null;
     },
 
     refreshCurrentView() {
@@ -787,9 +886,17 @@ function appState() {
     },
 
     async logout(silent) {
-      if (!silent) await this.apiPost("logout", {}, { quiet: true });
+      if (!silent) {
+        const pending = this.queueItems.filter((i) => !i.failed).length;
+        const warn = [];
+        if (this.credentials.length) warn.push("Kata sandi sementara di layar akan hilang.");
+        if (pending) warn.push(pending + " data offline belum terkirim. Tetap tersimpan di HP dan terkirim setelah Anda login lagi.");
+        if (warn.length && !confirm("Keluar?\n\n" + warn.join("\n"))) return;
+        await this.apiPost("logout", {}, { quiet: true });
+      }
       this.session = null;
       this.credentials = [];
+      this.queueItems = [];
       this.resetData(); // jangan biarkan data/penempatan akun sebelumnya terbawa ke akun berikutnya
       localStorage.removeItem("magang_session");
       this.view = "dashboard";
@@ -798,6 +905,7 @@ function appState() {
     // ================= DASHBOARD =================
     async loadDashboard() {
       const json = await this.apiGet("dashboard_summary");
+      if (!this.session) return; // sesi berakhir (logout paksa) selagi menunggu respons
       if (json.status === "success") this.dashboard = json.data;
       if (this.session.user.role === "siswa") this.loadProfile();
     },
@@ -812,6 +920,9 @@ function appState() {
       this.users = [];
       this.placements = [];
       this.reviewQueue = [];
+      this.photoCache = {};
+      this.photoLoading = {};
+      this.editingPlacementId = null;
       this.logbookForm = this_defaultLogbookForm();
       this.photoPreview = null;
       this.photoBase64 = null;
@@ -888,8 +999,14 @@ function appState() {
         return;
       }
       this.logbookForm = { ...entry };
-      this.photoPreview = entry.photo_drive_url || null;
+      this.photoPreview = null;
       this.photoBase64 = null;
+      // Foto privat: diambil lewat server (cek hak akses), bukan tautan Drive langsung.
+      if (entry.photo_drive_url) {
+        this.loadPhoto(entry.id).then((url) => {
+          if (url && this.logbookForm.id === entry.id && !this.photoBase64) this.photoPreview = url;
+        });
+      }
       this.logbookFormError = "";
       this.view = "logbook_form";
     },
@@ -1030,18 +1147,18 @@ function appState() {
       if (!confirm("Kirim jurnal minggu ke-" + w.week_number + "?")) return;
       const json = await this.apiPost("submit_weekly", { id: w.id });
       if (json.status === "success") { this.toast("Jurnal dikirim.", "success"); this.loadWeekly(); }
+      else { this.reportFailure(json, "Gagal mengirim jurnal."); this.loadWeekly(); }
     },
 
     // ================= MENTOR / GURU REVIEW =================
     async loadReviewQueue() {
+      if (!this.session) return;
       const role = this.session.user.role;
-      if (role === "mentor") {
-        const json = await this.apiGet("list_logbooks", { status: "Submitted" });
-        if (json.status === "success") this.reviewQueue = json.data;
-      } else if (role === "guru") {
-        const json = await this.apiGet("list_weekly");
-        if (json.status === "success") this.reviewQueue = json.data.filter((w) => w.status === "Submitted");
-      }
+      let json = null;
+      if (role === "mentor") json = await this.apiGet("list_logbooks", { status: "Submitted" });
+      else if (role === "guru") json = await this.apiGet("list_weekly");
+      if (!json || !this.session || json.status !== "success") return;
+      this.reviewQueue = role === "mentor" ? json.data : json.data.filter((w) => w.status === "Submitted");
     },
 
     async validateLogbook(entry, decision) {
@@ -1058,6 +1175,9 @@ function appState() {
       if (json.status === "success") {
         this.toast("Status diperbarui.", "success");
         this.loadReviewQueue();
+      } else {
+        this.reportFailure(json, "Gagal memperbarui status.");
+        this.loadReviewQueue();
       }
     },
 
@@ -1065,6 +1185,7 @@ function appState() {
       const notes = prompt("Catatan guru pendamping (opsional):") || "";
       const json = await this.apiPost("verify_weekly", { id: w.id, guru_notes: notes });
       if (json.status === "success") { this.toast("Jurnal diverifikasi.", "success"); this.loadReviewQueue(); }
+      else { this.reportFailure(json, "Gagal memverifikasi jurnal."); this.loadReviewQueue(); }
     },
 
     // ================= ADMIN =================
@@ -1097,28 +1218,97 @@ function appState() {
       }
     },
 
-    async createPlacement() {
-      const json = await this.apiPost("create_placement", this.newPlacementForm);
+    async savePlacement() {
+      const f = this.newPlacementForm;
+      const json = this.editingPlacementId
+        ? await this.apiPost("update_placement", { ...f, id: this.editingPlacementId })
+        : await this.apiPost("create_placement", f);
       if (json.status === "success") {
-        this.toast("Penempatan dibuat.", "success");
-        this.newPlacementForm = { student_id: "", mentor_id: "", guru_id: "", company_name: "", department: "", start_date: "", end_date: "" };
+        this.toast(this.editingPlacementId ? "Penempatan diperbarui." : "Penempatan dibuat.", "success");
+        this.cancelEditPlacement();
         this.loadPlacements();
       } else {
-        this.toast(json.message || "Gagal membuat penempatan.", "error");
+        this.reportFailure(json, "Gagal menyimpan penempatan.");
       }
     },
 
-    parseBulkImport() {
-      // Format CSV sederhana: identity_number,name,email,phone_number,company_name,department,start_date,end_date
-      const lines = this.bulkImportRaw.trim().split("\n").filter(Boolean);
-      this.bulkImportRows = lines.map((line) => {
-        const [identity_number, name, email, phone_number, company_name, department, start_date, end_date] = line.split(",").map((s) => s.trim());
-        return { identity_number, name, email, phone_number, company_name, department, start_date, end_date };
+    editPlacement(p) {
+      this.editingPlacementId = p.id;
+      this.newPlacementForm = {
+        student_id: p.student_id, mentor_id: p.mentor_id || "", guru_id: p.guru_id || "",
+        company_name: p.company_name || "", department: p.department || "",
+        start_date: p.start_date || "", end_date: p.end_date || "", status: p.status || "active"
+      };
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    },
+
+    cancelEditPlacement() {
+      this.editingPlacementId = null;
+      this.newPlacementForm = { student_id: "", mentor_id: "", guru_id: "", company_name: "", department: "", start_date: "", end_date: "", status: "active" };
+    },
+
+    // Baca satu baris CSV; tanda kutip ganda dihormati ("Puskesmas A, Kota" tidak pecah).
+    splitCsvLine(line) {
+      const out = [];
+      let cur = "";
+      let q = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (q) {
+          if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+          else if (ch === '"') q = false;
+          else cur += ch;
+        } else if (ch === '"') q = true;
+        else if (ch === ",") { out.push(cur.trim()); cur = ""; }
+        else cur += ch;
+      }
+      out.push(cur.trim());
+      return out;
+    },
+
+    // Cocokkan rujukan mentor/guru (ID, NISN/NIP, atau email). "" = kosong, null = tidak ketemu.
+    resolveUserRef(ref, role) {
+      const r = String(ref || "").trim().toLowerCase();
+      if (!r) return "";
+      const u = this.users.find((x) => x.role === role &&
+        [x.id, x.identity_number, x.email].some((v) => String(v || "").toLowerCase() === r));
+      return u ? u.id : null;
+    },
+
+    usersByRole(role) { return this.users.filter((u) => u.role === role); },
+
+    userLabel(id) {
+      const u = this.users.find((x) => x.id === id);
+      return u ? u.name : (id || "-");
+    },
+
+    // Format: nisn,nama,email,no_hp,nama_instansi,divisi,tgl_mulai,tgl_selesai,mentor,guru
+    async parseBulkImport() {
+      if (!this.users.length) await this.loadUsers(); // perlu daftar mentor/guru untuk mencocokkan
+      let lines = this.bulkImportRaw.replace(/\r/g, "").split("\n").map((l) => l.trim()).filter(Boolean);
+      if (lines.length && /^nisn\b/i.test(lines[0])) lines = lines.slice(1); // lewati baris judul
+      this.bulkImportRows = lines.map((line, i) => {
+        const [identity_number, name, email, phone_number, company_name, department, start_date, end_date, mentor_ref, guru_ref] = this.splitCsvLine(line);
+        const mentor_id = this.resolveUserRef(mentor_ref, "mentor");
+        const guru_id = this.resolveUserRef(guru_ref, "guru");
+        const problems = [];
+        if (!name) problems.push("nama kosong");
+        if (!identity_number) problems.push("NISN kosong");
+        if (mentor_id === null) problems.push("mentor tidak ditemukan: " + mentor_ref);
+        if (guru_id === null) problems.push("guru tidak ditemukan: " + guru_ref);
+        return {
+          row: i + 1, identity_number, name, email, phone_number, company_name, department,
+          start_date, end_date, mentor_id: mentor_id || "", guru_id: guru_id || "", problems
+        };
       });
     },
 
     async submitBulkImport() {
       if (!this.bulkImportRows.length) { this.toast("Belum ada baris untuk diimpor.", "warn"); return; }
+      if (this.bulkImportRows.some((r) => r.problems.length)) {
+        this.toast("Perbaiki dulu baris yang bermasalah (lihat kolom Cek).", "error", 6000);
+        return;
+      }
       const json = await this.apiPost("bulk_import_students", { students: this.bulkImportRows });
       if (json.status === "success") {
         const rows = this.bulkImportRows;
@@ -1135,7 +1325,7 @@ function appState() {
         this.loadUsers();
         this.loadPlacements();
       } else {
-        this.toast(json.message || "Gagal impor massal.", "error");
+        this.reportFailure(json, "Gagal impor massal.", 10000);
       }
     },
 
@@ -1365,10 +1555,30 @@ function compressImageToBase64(file, maxDimension = 1280, quality = 0.7, targetK
             admin_placements: 'Manajemen Penempatan',
             admin_evaluations: 'Rekap Nilai'
           }[view] || 'MagangIC'"></h1>
-          <button class="btn btn-secondary" style="display:none;" @click="logout()">Keluar</button>
+          <button class="btn btn-secondary topbar-logout" @click="logout()">Keluar</button>
         </header>
 
         <main class="content">
+
+          <!-- ============ ANTREAN OFFLINE ============ -->
+          <div class="card" x-show="queueItems.length && ['dashboard','logbook','weekly'].includes(view)" style="border-color:#d97706;">
+            <h2>Data Offline</h2>
+            <p class="caption">Tersimpan di HP dan belum sampai ke server.</p>
+            <template x-for="it in queueItems" :key="it.client_uuid">
+              <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap;">
+                <div>
+                  <p x-text="queueLabel(it)"></p>
+                  <p class="caption" x-show="!it.failed">Menunggu terkirim…</p>
+                  <p class="caption" x-show="it.failed" style="color:var(--color-error);" x-text="'Ditolak server: ' + (it.error || 'gagal')"></p>
+                </div>
+                <div x-show="it.failed" style="display:flex;gap:8px;">
+                  <button class="btn btn-secondary" @click="retryQueueItem(it)">Coba lagi</button>
+                  <button class="btn btn-secondary" style="color:var(--color-error);border-color:var(--color-error);" @click="discardQueueItem(it)">Buang</button>
+                </div>
+              </div>
+            </template>
+            <button class="btn btn-secondary" style="margin-top:12px;" x-show="online && pendingQueue().length" @click="syncQueue()">Kirim sekarang</button>
+          </div>
 
           <!-- ============ DASHBOARD ============ -->
           <template x-if="view === 'dashboard'">
@@ -1439,6 +1649,18 @@ function compressImageToBase64(file, maxDimension = 1280, quality = 0.7, targetK
                     </span>
                   </div>
                   <p style="margin:8px 0;" x-text="entry.activity_desc"></p>
+                  <template x-if="entry.photo_drive_url">
+                    <div style="margin:8px 0;">
+                      <template x-if="!photoCache[entry.id]">
+                        <button class="btn btn-secondary" :disabled="!!photoLoading[entry.id]" @click="loadPhoto(entry.id)">
+                          <span x-show="photoLoading[entry.id]" class="spinner"></span> 📷 Lihat foto
+                        </button>
+                      </template>
+                      <template x-if="photoCache[entry.id]">
+                        <img :src="photoCache[entry.id]" class="preview" alt="Foto bukti kegiatan" />
+                      </template>
+                    </div>
+                  </template>
                   <p class="caption" x-show="entry.mentor_notes" x-text="'Catatan mentor: ' + entry.mentor_notes"></p>
                   <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
                     <button class="btn btn-secondary" x-show="!entry.is_locked" @click="editLogbook(entry)">Edit</button>
@@ -1589,6 +1811,18 @@ function compressImageToBase64(file, maxDimension = 1280, quality = 0.7, targetK
                       <h2 x-text="item.date"></h2>
                       <p class="caption" x-text="item.work_mode + ' • ' + item.category"></p>
                       <p style="margin:8px 0;" x-text="item.activity_desc"></p>
+                  <template x-if="item.photo_drive_url">
+                    <div style="margin:8px 0;">
+                      <template x-if="!photoCache[item.id]">
+                        <button class="btn btn-secondary" :disabled="!!photoLoading[item.id]" @click="loadPhoto(item.id)">
+                          <span x-show="photoLoading[item.id]" class="spinner"></span> 📷 Lihat foto
+                        </button>
+                      </template>
+                      <template x-if="photoCache[item.id]">
+                        <img :src="photoCache[item.id]" class="preview" alt="Foto bukti kegiatan" />
+                      </template>
+                    </div>
+                  </template>
                       <div style="display:flex;gap:8px;">
                         <button class="btn btn-primary" @click="validateLogbook(item, 'approve')">✓ Setujui</button>
                         <button class="btn btn-secondary" style="color:var(--color-error);border-color:var(--color-error);" @click="validateLogbook(item, 'reject')">⚠ Minta Revisi</button>
@@ -1656,11 +1890,33 @@ function compressImageToBase64(file, maxDimension = 1280, quality = 0.7, targetK
 
               <div class="card">
                 <h2>Impor Massal Siswa (CSV)</h2>
-                <p class="caption">Format per baris: nisn,nama,email,no_hp,nama_instansi,divisi,tgl_mulai,tgl_selesai</p>
-                <textarea rows="4" x-model="bulkImportRaw" placeholder="1234,Budi Santoso,budi@mail.com,08123,Puskesmas A,Farmasi,2026-01-05,2026-03-05"></textarea>
+                <p class="caption">Format per baris: nisn,nama,email,no_hp,nama_instansi,divisi,tgl_mulai,tgl_selesai,mentor,guru<br />
+                  Kolom mentor dan guru (opsional) boleh berisi ID, NISN/NIP, atau email pengguna yang sudah terdaftar. Beri tanda kutip jika ada koma, mis. "Puskesmas A, Kota". Maksimal 100 baris.</p>
+                <textarea rows="4" x-model="bulkImportRaw" placeholder="1234,Budi Santoso,budi@mail.com,08123,Puskesmas A,Farmasi,2026-01-05,2026-03-05,mentor@mail.com,guru@mail.com"></textarea>
                 <div style="display:flex;gap:8px;margin-top:8px;">
                   <button class="btn btn-secondary" @click="parseBulkImport()">Pratinjau</button>
-                  <button class="btn btn-primary" @click="submitBulkImport()" x-show="bulkImportRows.length">Impor <span x-text="bulkImportRows.length"></span> Siswa</button>
+                  <button class="btn btn-primary" @click="submitBulkImport()" x-show="bulkImportRows.length" :disabled="bulkImportRows.some((r) => r.problems.length)">Impor <span x-text="bulkImportRows.length"></span> Siswa</button>
+                </div>
+                <div class="overflow-x" x-show="bulkImportRows.length" style="margin-top:12px;">
+                  <table class="data-table">
+                    <thead><tr><th>#</th><th>Nama</th><th>NISN</th><th>Instansi</th><th>Mentor</th><th>Guru</th><th>Cek</th></tr></thead>
+                    <tbody>
+                      <template x-for="r in bulkImportRows" :key="r.row">
+                        <tr>
+                          <td x-text="r.row"></td>
+                          <td x-text="r.name"></td>
+                          <td x-text="r.identity_number"></td>
+                          <td x-text="r.company_name"></td>
+                          <td x-text="r.mentor_id ? userLabel(r.mentor_id) : '-'"></td>
+                          <td x-text="r.guru_id ? userLabel(r.guru_id) : '-'"></td>
+                          <td>
+                            <span x-show="!r.problems.length">✓</span>
+                            <span x-show="r.problems.length" style="color:var(--color-error);" x-text="r.problems.join('; ')"></span>
+                          </td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
                 </div>
               </div>
 
@@ -1686,27 +1942,64 @@ function compressImageToBase64(file, maxDimension = 1280, quality = 0.7, targetK
           <template x-if="view === 'admin_placements'">
             <div>
               <div class="card">
-                <h2>Tambah Penempatan</h2>
+                <h2 x-text="editingPlacementId ? 'Ubah Penempatan ' + editingPlacementId : 'Tambah Penempatan'"></h2>
                 <div class="grid-2" style="margin-top:12px;">
-                  <div class="field"><label>ID Siswa</label><input x-model="newPlacementForm.student_id" placeholder="USR-xxx" /></div>
-                  <div class="field"><label>ID Mentor</label><input x-model="newPlacementForm.mentor_id" placeholder="USR-xxx" /></div>
-                  <div class="field"><label>ID Guru Pendamping</label><input x-model="newPlacementForm.guru_id" placeholder="USR-xxx" /></div>
+                  <div class="field">
+                    <label>Siswa</label>
+                    <select x-model="newPlacementForm.student_id" :disabled="!!editingPlacementId">
+                      <option value="">— pilih —</option>
+                      <template x-for="u in usersByRole('siswa')" :key="u.id">
+                        <option :value="u.id" :selected="u.id === newPlacementForm.student_id" x-text="u.name + ' (' + (u.identity_number || u.email || u.id) + ')'"></option>
+                      </template>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label>Mentor Industri</label>
+                    <select x-model="newPlacementForm.mentor_id">
+                      <option value="">— pilih —</option>
+                      <template x-for="u in usersByRole('mentor')" :key="u.id">
+                        <option :value="u.id" :selected="u.id === newPlacementForm.mentor_id" x-text="u.name + ' (' + (u.identity_number || u.email || u.id) + ')'"></option>
+                      </template>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label>Guru Pendamping</label>
+                    <select x-model="newPlacementForm.guru_id">
+                      <option value="">— pilih —</option>
+                      <template x-for="u in usersByRole('guru')" :key="u.id">
+                        <option :value="u.id" :selected="u.id === newPlacementForm.guru_id" x-text="u.name + ' (' + (u.identity_number || u.email || u.id) + ')'"></option>
+                      </template>
+                    </select>
+                  </div>
                   <div class="field"><label>Nama Instansi</label><input x-model="newPlacementForm.company_name" /></div>
                   <div class="field"><label>Divisi</label><input x-model="newPlacementForm.department" /></div>
                   <div class="field"><label>Tanggal Mulai</label><input type="date" x-model="newPlacementForm.start_date" /></div>
                   <div class="field"><label>Tanggal Selesai</label><input type="date" x-model="newPlacementForm.end_date" /></div>
+                  <div class="field" x-show="editingPlacementId">
+                    <label>Status</label>
+                    <select x-model="newPlacementForm.status">
+                      <option value="active" :selected="newPlacementForm.status === 'active'">Aktif</option>
+                      <option value="closed" :selected="newPlacementForm.status === 'closed'">Selesai</option>
+                    </select>
+                  </div>
                 </div>
-                <button class="btn btn-primary" @click="createPlacement()">Simpan Penempatan</button>
+                <div style="display:flex;gap:8px;">
+                  <button class="btn btn-primary" @click="savePlacement()" x-text="editingPlacementId ? 'Simpan Perubahan' : 'Simpan Penempatan'"></button>
+                  <button class="btn btn-secondary" x-show="editingPlacementId" @click="cancelEditPlacement()">Batal</button>
+                </div>
               </div>
               <div class="card overflow-x">
                 <h2>Daftar Penempatan</h2>
                 <table class="data-table">
-                  <thead><tr><th>ID</th><th>Siswa</th><th>Instansi</th><th>Mentor</th><th>Guru</th><th>Status</th></tr></thead>
+                  <thead><tr><th>ID</th><th>Siswa</th><th>Instansi</th><th>Mentor</th><th>Guru</th><th>Periode</th><th>Status</th><th></th></tr></thead>
                   <tbody>
                     <template x-for="p in placements" :key="p.id">
                       <tr>
-                        <td x-text="p.id"></td><td x-text="p.student_id"></td><td x-text="p.company_name"></td>
-                        <td x-text="p.mentor_id"></td><td x-text="p.guru_id"></td><td x-text="p.status"></td>
+                        <td x-text="p.id"></td><td x-text="userLabel(p.student_id)"></td><td x-text="p.company_name"></td>
+                        <td x-text="userLabel(p.mentor_id)"></td><td x-text="userLabel(p.guru_id)"></td>
+                        <td x-text="(p.start_date || '-') + ' s/d ' + (p.end_date || '-')"></td>
+                        <td x-text="p.status"></td>
+                        <td><button class="btn btn-secondary" style="min-height:32px;font-size:12px;" @click="editPlacement(p)">Ubah</button></td>
                       </tr>
                     </template>
                   </tbody>
